@@ -22,6 +22,7 @@
     let feedCount = [...(feed?.querySelectorAll('a.hfpxzc') || [])].length;
     let searchBoxClassCount = document.querySelector('#omnibox-singlebox')?.classList.length;
     let isLoading = (searchBoxClassCount || (refreshButton && !refreshLoadingIcon)) || (hasResults && feedScrolledToBottom && !isEnd);
+
     if (document.querySelector('[role=main]:not(:has([role=feed]))') && hasFeed) {
         return 'place-open';
     }
