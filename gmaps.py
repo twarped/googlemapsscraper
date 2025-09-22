@@ -18,7 +18,7 @@ from nodriverplus import RequestPausedHandler
 
 conn = duckdb.connect("places.duckdb")
 conn.execute(
-    "CREATE TABLE IF NOT EXISTS places (search_term TEXT, name TEXT, address TEXT, website TEXT, cid TEXT PRIMARY KEY, latitude REAL, longitude REAL, phone TEXT, timezone TEXT, language TEXT, country TEXT)"
+    "CREATE TABLE IF NOT EXISTS places (search_term TEXT, name TEXT, address TEXT, website TEXT, place_id TEXT PRIMARY KEY, cid TEXT, latitude REAL, longitude REAL, phone TEXT, timezone TEXT, language TEXT, country TEXT, review_count INTEGER, average_rating REAL)"
 )
 
 # tiles table persists hierarchical tile state
@@ -59,7 +59,7 @@ PAN_STALL_THRESHOLD = 2  # number of non-improving iterations before growth
 # removed exploration zoom constant; zoom now stays where gestures leave it
 
 conn.execute(
-    "CREATE TABLE IF NOT EXISTS map_state (lat REAL, lon REAL, zoom REAL, pan_direction TEXT, search_term TEXT, last_lat_direction TEXT, updated_at TIMESTAMP)"
+    "CREATE TABLE IF NOT EXISTS map_state (lat REAL, lon REAL, zoom REAL, pan_direction TEXT, search_term TEXT, last_lat_direction TEXT, current_tile_z INTEGER, current_tile_x INTEGER, current_tile_y INTEGER, updated_at TIMESTAMP)"
 )
 
 
@@ -83,37 +83,40 @@ class MapScraper(RequestPausedHandler):
             return
 
         new_places = 0
-        # collect all cids to check existence in batch
-        cids = []
+        # collect all place_ids to check existence in batch
+        place_ids = []
         for p in data[64]:
             try:
                 p = p[1]
-                cid_str = p[10].split(":")[1]
-                cid = str(int(cid_str, 16))
-                cids.append(cid)
+                place_id = p[10]
+                place_ids.append(place_id)
             except Exception as e:
+                with open("data_debug.json", "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
                 logging.error(
-                    "error processing place data: %s\n  p = %s\n  data = %s", e, p, data
+                    "error processing place data: %s\n  p = %s\ndata saved to data_debug.json", e, p
                 )
 
-        # query existing cids in batch
-        if cids:
-            existing_cids = set(
+        # query existing place_ids in batch
+        if place_ids:
+            existing_place_ids = set(
                 row[0]
                 for row in conn.execute(
-                    "SELECT cid FROM places WHERE cid IN ?", (tuple(cids),)
+                    "SELECT place_id FROM places WHERE place_id IN ?",
+                    (tuple(place_ids),),
                 ).fetchall()
             )
         else:
-            existing_cids = set()
+            existing_place_ids = set()
 
         # collect new places for batch insert
         new_places_data = []
         for p in data[64]:
             p = p[1]
-            cid_str = p[10].split(":")[1]
+            place_id = p[10]
+            cid_str = place_id.split(":")[1]
             cid = str(int(cid_str, 16))
-            if cid in existing_cids:
+            if place_id in existing_place_ids:
                 continue
             latitude = p[9][2] if p[9] and len(p[9]) > 2 else None
             longitude = p[9][3] if p[9] and len(p[9]) > 3 else None
@@ -125,12 +128,15 @@ class MapScraper(RequestPausedHandler):
             timezone = p[30] if len(p) > 30 else None
             language = p[110] if len(p) > 110 else None
             country = p[243] if len(p) > 243 else None
+            review_count = p[4][8] if p[4] and len(p[4]) > 8 else None
+            average_rating = p[4][7] if p[4] and len(p[4]) > 7 else None
             new_places_data.append(
                 (
                     search_term,
                     p[11],
                     p[39],
                     p[7][0] if p[7] and len(p[7]) > 0 else None,
+                    place_id,
                     cid,
                     latitude,
                     longitude,
@@ -138,13 +144,15 @@ class MapScraper(RequestPausedHandler):
                     timezone,
                     language,
                     country,
+                    review_count,
+                    average_rating,
                 )
             )
 
         # batch insert new places
         if new_places_data:
             conn.executemany(
-                "INSERT INTO places VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO places VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 new_places_data,
             )
             new_places = len(new_places_data)
@@ -167,12 +175,25 @@ def save_map_state(
     pan_direction: str,
     search_term: str | None,
     last_lat_direction: str | None,
+    current_tile_z: int | None = None,
+    current_tile_x: int | None = None,
+    current_tile_y: int | None = None,
 ):
     # overwrite single row
     conn.execute("DELETE FROM map_state")
     conn.execute(
-        "INSERT INTO map_state VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-        (lat, lon, zoom, pan_direction, search_term, last_lat_direction),
+        "INSERT INTO map_state VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+        (
+            lat,
+            lon,
+            zoom,
+            pan_direction,
+            search_term,
+            last_lat_direction,
+            current_tile_z,
+            current_tile_x,
+            current_tile_y,
+        ),
     )
 
 
@@ -378,7 +399,7 @@ async def zoom_out_to_limit(tab, center, max_attempts: int = 20):
     settled = 0
     best_zoom = last_zoom
     for _ in range(max_attempts):
-        await settle_map_state(tab, ignore=["refresh", "scroll"])
+        await settle_map_state(tab, ignore=["refresh", "scroll", "no-feed"])
         await scroll(
             tab,
             x=center[0] + random.uniform(-40, 40),
@@ -434,9 +455,6 @@ def ensure_initial_frontier(
     return 1, z, 1
 
 
-# removed legacy bulk seeding; dynamic frontier only
-
-
 def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
@@ -475,7 +493,7 @@ def mercator_tile_bounds(z: int, x: int, y: int) -> tuple[float, float, float, f
 
 def next_pending_tile(search_term: str):
     row = conn.execute(
-        "SELECT z,x,y FROM tiles WHERE search_term=? AND status='pending' ORDER BY passes, last_visit_ts NULLS FIRST LIMIT 1",
+        "SELECT z,x,y FROM tiles WHERE search_term=? AND (status IN ('pending', 'in_progress') OR (status='completed' AND (feed_complete = FALSE OR expanded = FALSE))) ORDER BY CASE WHEN status = 'in_progress' THEN 0 ELSE 1 END, passes, last_visit_ts NULLS FIRST LIMIT 1",
         (search_term,),
     ).fetchone()
     return row if row else None
@@ -522,7 +540,9 @@ async def run_tile_coverage(
     max_iters: int = 5,
 ) -> tuple[int, int, bool, bool, int]:
     # loop calling settle_map_state until saturated or end or iteration cap
-    before_total = conn.execute("SELECT COUNT(*) FROM places WHERE search_term=?", (search_term,)).fetchone()[0]
+    before_total = conn.execute(
+        "SELECT COUNT(*) FROM places WHERE search_term=?", (search_term,)
+    ).fetchone()[0]
     cumulative_new = 0
     last_count = 0
     last_saturated = False
@@ -537,13 +557,15 @@ async def run_tile_coverage(
         # but when I'm at 3z, I don't always see 120 results even if I know it's saturated.
         # maybe it turns out that for some reason, this issue only occurs at the lowest
         # possible zoom on the device. but to play it safe, I'm going to say that at 3z or
-        # root zoom below, any nonzero count means saturated. 
+        # root zoom below, any nonzero count means saturated.
 
         if zoom <= 3 or zoom <= root_zoom:
             last_saturated = last_count > 0
         else:
             last_saturated = last_count == 20 or last_count == 61 or last_count >= 120
-        after_total = conn.execute("SELECT COUNT(*) FROM places WHERE search_term=?", (search_term,)).fetchone()[0]
+        after_total = conn.execute(
+            "SELECT COUNT(*) FROM places WHERE search_term=?", (search_term,)
+        ).fetchone()[0]
         cumulative_new = after_total - before_total
         if st == "end" and (last_count > 0 or iters >= 2):
             feed_complete = True
@@ -687,7 +709,7 @@ async def pan_to(
         return max(PAN_MIN_DEG, min(raw, PAN_BASE_DEG))
 
     def _tile_width_deg(z: float) -> float:
-        return 360.0 / (2 ** z)
+        return 360.0 / (2**z)
 
     def _deg_distance(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> float:
         d_lat = abs(a_lat - b_lat)
@@ -711,12 +733,14 @@ async def pan_to(
     z_lower = int(max(2, math.floor(z_fit - 0.25)))
     # derive upper band by ensuring tolerance spans at least PIX_TOL px at initial zoom
     PIX_TOL = 12.0
+
     def _pixels_for_tol_fixed(z_test: int) -> float:
         # use initial position for pixel calc
         a_y = _mercator_project(cur_lat, cur_lon, z_test)[1]
         b_lat = cur_lat + base_tol if target_lat > cur_lat else cur_lat - base_tol
         b_y = _mercator_project(b_lat, cur_lon, z_test)[1]
         return abs(b_y - a_y)
+
     z_upper = int(round(z_fit))
     while z_upper < 19 and _pixels_for_tol_fixed(z_upper) < PIX_TOL:
         z_upper += 1
@@ -725,7 +749,9 @@ async def pan_to(
     # cap z_upper at target_zoom if provided
     if target_zoom is not None:
         z_upper = min(z_upper, target_zoom)
-        z_lower = max(z_lower, target_zoom - 1)  # allow slight below if needed, but not above
+        z_lower = max(
+            z_lower, target_zoom - 1
+        )  # allow slight below if needed, but not above
     # cost coefficients
     COST_ZOOM = 1.0  # cost per absolute zoom level change
     COST_DRAG_UNIT = 1.0 / 420.0  # cost per pixel of drag (normalized)
@@ -736,12 +762,14 @@ async def pan_to(
     BAND_HIGH_PEN = 1.6
 
     # clamp detection tuning (all angular in degrees)
-    CLAMP_DESIRED_FACTOR = 2.0
-    CLAMP_REALIZED_FACTOR = 0.18
     CLAMP_DECAY = 0.6  # decay per loop of clamp suspicion score
     CLAMP_ESCALATE_CONSEC = 2  # consecutive clamps at same zoom triggers extra zoom out
-    CLAMP_MIN_PX_DESIRED = 18  # min projected vertical pixels we consider a meaningful intended move
-    CLAMP_MAX_PX_REALIZED = 3  # realized vertical pixels below this when intended large -> clamp
+    CLAMP_MIN_PX_DESIRED = (
+        18  # min projected vertical pixels we consider a meaningful intended move
+    )
+    CLAMP_MAX_PX_REALIZED = (
+        3  # realized vertical pixels below this when intended large -> clamp
+    )
     MAX_LOOPS = min(140, 16 + int(dist_initial * 8))
     loops = 0
     last_action = "start"
@@ -749,6 +777,7 @@ async def pan_to(
     final_lon = cur_lon
     stagnation = 0
     prev_err = _deg_distance(cur_lat, cur_lon, target_lat, target_lon)
+    prev_lon_err = None
     adaptive_tol = base_tol
     clamp_score = 0.0
     clamp_events_consec = 0
@@ -756,6 +785,9 @@ async def pan_to(
     # lazy root zoom detection (discover coarse floor only after an ineffective zoom-out)
     root_zoom_detected = False
     root_zoom_floor = 0
+    success = False
+    # guard window after a clamp-driven escalation so we do not instantly zoom back down
+    clamp_escalated_guard = 0
 
     while True:
         loops += 1
@@ -768,15 +800,22 @@ async def pan_to(
         if cur_lat is None or cur_lon is None:
             logging.info("pan_to: failed to get lat/lon")
             break
+        if clamp_escalated_guard > 0:
+            clamp_escalated_guard -= 1
         final_lat, final_lon = cur_lat, cur_lon
         lat_err = abs(cur_lat - target_lat)
         lon_err = abs(_normalize_longitude(cur_lon) - _normalize_longitude(target_lon))
         # boundary saturation: if target beyond representable latitude edge treat as satisfied vertically
         if abs(target_lat) >= (MAX_LAT - LAT_EDGE_PADDING * 0.5):
             # clamp target inside representable range for error evaluation
-            eff_target_lat = _clamp(target_lat, -MAX_LAT + LAT_EDGE_PADDING, MAX_LAT - LAT_EDGE_PADDING)
+            eff_target_lat = _clamp(
+                target_lat, -MAX_LAT + LAT_EDGE_PADDING, MAX_LAT - LAT_EDGE_PADDING
+            )
             lat_err = abs(cur_lat - eff_target_lat)
-            logging.info("pan_to: boundary saturation applied, eff_target_lat=%.7f", eff_target_lat)
+            logging.info(
+                "pan_to: boundary saturation applied, eff_target_lat=%.7f",
+                eff_target_lat,
+            )
         err = max(lat_err, lon_err)
         # dynamic stall detect to relax tolerance slightly
         if err > prev_err * 0.995:
@@ -790,7 +829,19 @@ async def pan_to(
         eff_tol = min(adaptive_tol, _zoom_tol(z_now))
         lon_tile_tol = _tile_width_deg(z_now) / 64.0
         lon_eff_tol = max(lon_tile_tol, eff_tol * 0.5)
-        logging.info("pan_to loop %d: lat=%.7f lon=%.7f tgt_lat=%.7f tgt_lon=%.7f z=%.1f lat_err=%.5f lon_err=%.5f eff_tol=%.5f clamp_score=%.3f", loops, cur_lat, cur_lon, target_lat, target_lon, z_now, lat_err, lon_err, eff_tol, clamp_score)
+        logging.info(
+            "pan_to loop %d: lat=%.7f lon=%.7f tgt_lat=%.7f tgt_lon=%.7f z=%.1f lat_err=%.5f lon_err=%.5f eff_tol=%.5f clamp_score=%.3f",
+            loops,
+            cur_lat,
+            cur_lon,
+            target_lat,
+            target_lon,
+            z_now,
+            lat_err,
+            lon_err,
+            eff_tol,
+            clamp_score,
+        )
         if lat_err <= eff_tol and lon_err <= lon_eff_tol:
             logging.info("pan_to: converged")
             break
@@ -800,6 +851,15 @@ async def pan_to(
         # apply root zoom floor only after empirical detection
         if root_zoom_detected and z_lower < root_zoom_floor:
             z_lower = root_zoom_floor
+        # normalize band each loop; prevent inversion and shrink once within tighter error
+        if z_upper < z_lower:
+            z_upper = z_lower
+        # if root floor detected lock upper to floor when no explicit target
+        if root_zoom_detected and target_zoom is None:
+            z_upper = root_zoom_floor
+        # opportunistic tightening: once error shrinks substantially, avoid widening band
+        if prev_err < dist_initial * 0.6 and (z_upper - z_lower) > 2:
+            z_upper = max(z_lower + 1, z_lower + (z_upper - z_lower) // 2)
         candidates = {int(round(z_now)), z_lower, z_upper}
         # always allow a test zoom-out; detection will mark floor if ineffective
         if z_now - 1 >= 2:  # hard lower bound from tile scheme
@@ -815,18 +875,24 @@ async def pan_to(
         best_zoom = int(round(z_now))
         best_cost = float("inf")
         stay_zoom = int(round(z_now))
+        stay_cost = float("inf")
         for zc in candidates:
             zc = int(max(2, min(19, zc)))
             if root_zoom_detected and zc < root_zoom_floor:
                 continue
             if target_zoom is not None and zc > target_zoom:
                 continue
-            delta_x, delta_y = _world_delta(cur_lat, cur_lon, target_lat, target_lon, zc)
+            # skip immediate zoom-down right after clamp escalation to let higher zoom help drag
+            if clamp_escalated_guard > 0 and zc < int(round(z_now)):
+                continue
+            delta_x, delta_y = _world_delta(
+                cur_lat, cur_lon, target_lat, target_lon, zc
+            )
             drag_pixels = math.sqrt(delta_x * delta_x + delta_y * delta_y)
             drag_cost = COST_DRAG_UNIT * drag_pixels * max(0.5, zc / 10.0)
             zoom_cost = COST_ZOOM * abs(zc - z_now)
             if zc < z_now:
-                zoom_cost *= 0.1  # favor zoom-out
+                zoom_cost *= 0.25  # favor zoom-out
             # band penalties
             band_pen = 0.0
             if zc < z_lower:
@@ -834,15 +900,21 @@ async def pan_to(
             if zc > z_upper:
                 band_pen += BAND_HIGH_PEN * (zc - z_upper)
                 if target_zoom is not None and target_zoom < z_now:
-                    band_pen += BAND_HIGH_PEN * (zc - z_upper)  # extra penalty for high zoom when target is low
+                    band_pen += BAND_HIGH_PEN * (
+                        zc - z_upper
+                    )  # extra penalty for high zoom when target is low
             clamp_pen = 0.0
             if clamp_score > 0.05 and zc == stay_zoom and zc < z_upper:
                 # penalize staying coarse under clamp
                 clamp_pen += COST_CLAMP * clamp_score
             if clamp_score > 0.05 and zc > z_now:
                 clamp_pen += COST_CLAMP * 0.5 * clamp_score
-            mismatch_pen = 0.1 * abs(zc - target_zoom) if target_zoom is not None else 0.0
+            mismatch_pen = (
+                0.1 * abs(zc - target_zoom) if target_zoom is not None else 0.0
+            )
             total = drag_cost + zoom_cost + band_pen + clamp_pen + mismatch_pen
+            if zc == stay_zoom:
+                stay_cost = total
             logging.info(
                 "pan_to: zc=%d cost=%.3f drag=%.3f zoom=%.3f band=%.3f clamp=%.3f mismatch=%.3f z_lower=%d z_upper=%d clamp_consec=%d root_detected=%s root_floor=%d",
                 zc,
@@ -864,7 +936,7 @@ async def pan_to(
         # forced clamp zoom-in override
         if FORCE_CLAMP_UP and best_zoom == stay_zoom and stay_zoom < z_upper:
             best_zoom = stay_zoom + 1
-        if best_zoom != stay_zoom and (best_cost + 1e-6 < drag_cost if 'drag_cost' in locals() else True):
+        if best_zoom != stay_zoom and best_cost < stay_cost + 1e-6:
             before_zoom = int(round(z_now))
             logging.info(
                 "pan_to: choosing zoom -> %d from %d (band %d-%d root_detected=%s floor=%d)",
@@ -875,28 +947,49 @@ async def pan_to(
                 root_zoom_detected,
                 root_zoom_floor,
             )
-            await settle_map_state(tab, ignore=["refresh", "scroll"], target_zoom=best_zoom)
+            # stay away from no-feed when there's no search term
+            await settle_map_state(
+                tab, ignore=["refresh", "scroll", "no-feed"], target_zoom=best_zoom
+            )
             after_zoom = lat_lon_zoom(tab.url)[2] or before_zoom
             logging.info(
-                "pan_to: zoom attempt complete target=%d before=%d after=%d root_detected=%s floor=%d", 
-                best_zoom, before_zoom, after_zoom, root_zoom_detected, root_zoom_floor
+                "pan_to: zoom attempt complete target=%d before=%d after=%d root_detected=%s floor=%d",
+                best_zoom,
+                before_zoom,
+                after_zoom,
+                root_zoom_detected,
+                root_zoom_floor,
             )
             # broaden detection: any downward attempt that failed OR overshot upward differently signals floor
-            if not root_zoom_detected and best_zoom < before_zoom and after_zoom == before_zoom:
+            if (
+                not root_zoom_detected
+                and best_zoom < before_zoom
+                and after_zoom == before_zoom
+            ):
                 root_zoom_detected = True
                 root_zoom_floor = before_zoom
-                logging.info("pan_to: root zoom detected empirically at %d", root_zoom_floor)
+                z_upper = root_zoom_floor
+                logging.info(
+                    "pan_to: root zoom detected empirically at %d", root_zoom_floor
+                )
             last_action = f"zoom->{best_zoom}"
             continue
-        logging.info("pan_to: choosing drag (band %d-%d best=%d)", z_lower, z_upper, best_zoom)
+        logging.info(
+            "pan_to: choosing drag (band %d-%d best=%d)", z_lower, z_upper, best_zoom
+        )
         # perform a drag step at current zoom
         viewport = await get_viewport(tab, max_age=0.0)
         step_limit = _pan_step_limit_pixels(viewport)
         dx, dy = _world_delta(cur_lat, cur_lon, target_lat, target_lon, z_now)
         if abs(dx) <= 1 and abs(dy) <= 1:
             # escalate only if latitude still large and we can gain resolution (z below upper band)
-            if (lat_err > eff_tol or lon_err > lon_eff_tol) and int(round(z_now)) < z_upper:
-                await settle_map_state(tab, ignore=["refresh", "scroll"], target_zoom=int(round(z_now + 1)))
+            if (lat_err > eff_tol or lon_err > lon_eff_tol) and int(
+                round(z_now)
+            ) < z_upper:
+                # stay away from no-feed when there's no search term
+                await settle_map_state(
+                    tab, ignore=["refresh", "scroll", "no-feed"], target_zoom=int(round(z_now + 1))
+                )
                 last_action = "zoom-escalate"
                 continue
             break
@@ -905,19 +998,27 @@ async def pan_to(
         pre_drag_merc_y = _mercator_project(cur_lat, cur_lon, z_now)[1]
         intended_merc_y = _mercator_project(target_lat, target_lon, z_now)[1]
         intended_pix_delta_y = intended_merc_y - pre_drag_merc_y
-        logging.info("pan_to: pre-drag intended_pix_delta_y=%.1f dx=%.1f dy=%.1f", intended_pix_delta_y, dx, dy)
+        logging.info(
+            "pan_to: pre-drag intended_pix_delta_y=%.1f dx=%.1f dy=%.1f",
+            intended_pix_delta_y,
+            dx,
+            dy,
+        )
         center_x, center_y = viewport.mapCenter
         map_left = viewport.mapLeft
         map_right = viewport.mapRight
         top_bound = 80.0
         bottom_bound = viewport.innerHeight - 80.0
-        start_x = _clamp(center_x + random.uniform(-25, 25), map_left + 40.0, map_right - 60.0)
+        start_x = _clamp(
+            center_x + random.uniform(-25, 25), map_left + 40.0, map_right - 60.0
+        )
         start_y = _clamp(center_y + random.uniform(-25, 25), top_bound, bottom_bound)
         drag_dx = _clamp(-dx, -step_limit, step_limit)
         drag_dy = _clamp(-dy, -step_limit, step_limit)
         end_x = _clamp(start_x + drag_dx, map_left + 40.0, map_right - 60.0)
         end_y = _clamp(start_y + drag_dy, top_bound, bottom_bound)
-        await settle_map_state(tab, ignore=["refresh", "scroll"], target_zoom=None)
+        # same here
+        await settle_map_state(tab, ignore=["refresh", "scroll", "no-feed"], target_zoom=None)
         await drag_bezier(
             tab,
             x0=start_x,
@@ -932,14 +1033,26 @@ async def pan_to(
         # post drag clamp detection
         post_lat, post_lon = await get_lat_lon_from_M6(tab)
         if post_lat is not None:
-            actual_merc_y = _mercator_project(post_lat, post_lon if post_lon is not None else cur_lon, z_now)[1]
+            actual_merc_y = _mercator_project(
+                post_lat, post_lon if post_lon is not None else cur_lon, z_now
+            )[1]
             actual_pix_delta_y = actual_merc_y - pre_drag_merc_y
             intended_px = abs(intended_pix_delta_y)
             actual_px = abs(actual_pix_delta_y)
             # pixel-based clamp detection tied to zoom (pixels already scaled by zoom in mercator_project)
             # require intended move above threshold and realized movement tiny
-            is_clamp = intended_px >= CLAMP_MIN_PX_DESIRED and actual_px <= CLAMP_MAX_PX_REALIZED
-            logging.info("pan_to: post-drag post_lat=%.7f actual_pix_delta_y=%.1f intended_px=%.1f actual_px=%.1f is_clamp=%s", post_lat, actual_pix_delta_y, intended_px, actual_px, is_clamp)
+            is_clamp = (
+                intended_px >= CLAMP_MIN_PX_DESIRED
+                and actual_px <= CLAMP_MAX_PX_REALIZED
+            )
+            logging.info(
+                "pan_to: post-drag post_lat=%.7f actual_pix_delta_y=%.1f intended_px=%.1f actual_px=%.1f is_clamp=%s",
+                post_lat,
+                actual_pix_delta_y,
+                intended_px,
+                actual_px,
+                is_clamp,
+            )
             if is_clamp:
                 clamp_score = min(1.5, clamp_score + 1.0)
                 if int(round(z_now)) == clamp_last_zoom:
@@ -947,47 +1060,100 @@ async def pan_to(
                 else:
                     clamp_events_consec = 1
                     clamp_last_zoom = int(round(z_now))
-                logging.info("pan_to: clamp detected, score=%.3f consec=%d", clamp_score, clamp_events_consec)
+                logging.info(
+                    "pan_to: clamp detected, score=%.3f consec=%d",
+                    clamp_score,
+                    clamp_events_consec,
+                )
                 if clamp_events_consec >= CLAMP_ESCALATE_CONSEC:
-                    if target_zoom is not None and z_now > target_zoom:
-                        # zoom out only if overshot target zoom
-                        zoom_target = max(root_zoom_floor if root_zoom_detected else 2, int(round(z_now - 1)))
-                        action = "zoom-out-clamp"
+                    # suppress escalation only if substantial horizontal improvement and latitude error not hugely above tolerance
+                    if prev_lon_err is None:
+                        horiz_progress = False
                     else:
-                        # default to zoom in for clamp resolution
-                        zoom_target = min(19, int(round(z_now + 1)))
-                        if target_zoom is not None:
-                            zoom_target = min(zoom_target, target_zoom)
-                        action = "zoom-in-clamp"
-                    logging.info("pan_to: triggering %s to %d", action, zoom_target)
-                    if zoom_target == int(round(z_now)):
-                        logging.info("pan_to: skipping escalation at max zoom %d", zoom_target)
+                        horiz_progress = lon_err < prev_lon_err * 0.7 and lat_err <= eff_tol * 2
+                    zoom_target = None
+                    if not horiz_progress:
+                        if target_zoom is not None and z_now > target_zoom:
+                            zoom_target = max(
+                                root_zoom_floor if root_zoom_detected else 2,
+                                int(round(z_now - 1)),
+                            )
+                            action = "zoom-out-clamp"
+                        else:
+                            zoom_target = min(19, int(round(z_now + 1)))
+                            if target_zoom is not None:
+                                zoom_target = min(zoom_target, target_zoom)
+                            # do not zoom above root floor lock
+                            if root_zoom_detected and zoom_target > root_zoom_floor:
+                                zoom_target = root_zoom_floor
+                            action = "zoom-in-clamp"
+                        # expand band upward so cost model does not immediately force zoom-out
+                        if zoom_target > z_upper:
+                            z_upper = zoom_target
+                        logging.info("pan_to: triggering %s to %d", action, zoom_target)
+                    else:
+                        logging.info("pan_to: suppressing clamp escalation due to horiz progress")
+                    if zoom_target is not None and zoom_target == int(round(z_now)):
+                        logging.info(
+                            "pan_to: skipping escalation at max zoom %d", zoom_target
+                        )
                         if clamp_events_consec >= 2:
+                            # if we are pretty close to the edge, then still succeed rather than quitting
+                            max_err = _zoom_tol(z_now) * (2 + (await get_viewport(tab)).devicePixelRatio)
+                            success = lat_err <= max_err
+                            logging.info(
+                                "pan_to is_clamp: success=%s | lat_err=%.5f <= max_err=%.5f",
+                                success,
+                                lat_err,
+                                max_err,
+                            )
                             break
-                    else:
+                    elif zoom_target is not None:
                         before_zoom = int(round(z_now))
-                        await settle_map_state(tab, ignore=["refresh", "scroll"], target_zoom=zoom_target)
+                        await settle_map_state(
+                            tab, ignore=["refresh", "scroll", "no-feed"], target_zoom=zoom_target
+                        )
                         after_zoom = lat_lon_zoom(tab.url)[2] or before_zoom
-                        if zoom_target < before_zoom and after_zoom == before_zoom and not root_zoom_detected:
+                        if (
+                            zoom_target < before_zoom
+                            and after_zoom == before_zoom
+                            and not root_zoom_detected
+                        ):
                             root_zoom_detected = True
                             root_zoom_floor = before_zoom
-                            logging.info("pan_to: root zoom detected during %s at %d", action, root_zoom_floor)
+                            logging.info(
+                                "pan_to: root zoom detected during %s at %d",
+                                action,
+                                root_zoom_floor,
+                            )
+                        # set guard to hold higher zoom for a couple loops
+                        if zoom_target > before_zoom:
+                            clamp_escalated_guard = 2
                         last_action = action
                         clamp_events_consec = 0
                         continue
             else:
                 clamp_events_consec = 0
         last_action = "drag"
+    prev_lon_err = lon_err
     # final success evaluation
-    success = False
     zoom_final = lat_lon_zoom(tab.url)[2]
-    if final_lat is not None and final_lon is not None:
+    tol_final = _zoom_tol(zoom_final)
+    if final_lat is not None and final_lon is not None and not success:
         lat_err = abs(final_lat - target_lat)
-        lon_err = abs(_normalize_longitude(final_lon) - _normalize_longitude(target_lon))
-        tol_final = _zoom_tol(zoom_final)
+        lon_err = abs(
+            _normalize_longitude(final_lon) - _normalize_longitude(target_lon)
+        )
         lon_tile_tol = _tile_width_deg(zoom_final if zoom_final else 1) / 64.0
         success = lat_err <= tol_final and lon_err <= max(lon_tile_tol, tol_final * 0.5)
-    logging.info("pan_to: final lat_err=%.5f lon_err=%.5f tol=%.5f success=%s loops=%d", lat_err, lon_err, tol_final, success, loops)
+    logging.info(
+        "pan_to: final lat_err=%.5f lon_err=%.5f tol=%.5f success=%s loops=%d",
+        lat_err,
+        lon_err,
+        tol_final,
+        success,
+        loops,
+    )
     if not success:
         logging.warning(
             "pan_to incomplete @%.7f,%.7f,%sz lat_err=%.5f lon_err=%.5f tol=%.5f loops=%d last=%s",
@@ -1000,7 +1166,7 @@ async def pan_to(
             loops,
             last_action,
         )
-    await settle_map_state(tab, ignore=["refresh", "scroll"], target_zoom=target_zoom)
+    await settle_map_state(tab, ignore=["refresh", "scroll", "no-feed"], target_zoom=target_zoom)
     return success
 
 
@@ -1129,7 +1295,7 @@ async def _align_zoom_to_target(tab, target_zoom: int, *, tolerance: float = 0.0
     while zoom is not None and abs(zoom - target_zoom) > tolerance:
         did_adjust_zoom = True
         direction_down = zoom > target_zoom
-        await settle_map_state(tab, ignore=["refresh", "scroll"])
+        await settle_map_state(tab, ignore=["refresh", "scroll", "no-feed"])
         zoom_before = lat_lon_zoom(tab.url)[2]
         await scroll(
             tab,
@@ -1146,7 +1312,11 @@ async def _align_zoom_to_target(tab, target_zoom: int, *, tolerance: float = 0.0
             no_change_count += 1
             # detect root zoom floor: if trying to zoom out and zoom won't change after 3 attempts
             if direction_down and no_change_count >= 3:
-                logging.info("_align_zoom_to_target: root zoom floor detected at %d (target %d)", zoom_before, target_zoom)
+                logging.info(
+                    "_align_zoom_to_target: root zoom floor detected at %d (target %d)",
+                    zoom_before,
+                    target_zoom,
+                )
                 zoom = zoom_before
                 break
         else:
@@ -1160,7 +1330,7 @@ async def _align_zoom_to_target(tab, target_zoom: int, *, tolerance: float = 0.0
         if zoom_crossings > 2:
             logging.info("too many zoom crossings, forcing normalization")
             for _ in range(12):
-                await settle_map_state(tab, ignore=["refresh", "scroll"])
+                await settle_map_state(tab, ignore=["refresh", "scroll", "no-feed"])
                 await scroll(
                     tab,
                     x=center[0],
@@ -1174,7 +1344,7 @@ async def _align_zoom_to_target(tab, target_zoom: int, *, tolerance: float = 0.0
             if zoom is None:
                 break
             for _ in range(target_zoom - zoom):
-                await settle_map_state(tab, ignore=["refresh", "scroll"])
+                await settle_map_state(tab, ignore=["refresh", "scroll", "no-feed"])
                 await scroll(
                     tab,
                     x=center[0],
@@ -1206,7 +1376,7 @@ async def settle_map_state(
     while True:
         if target_zoom is not None:
             await _align_zoom_to_target(tab, target_zoom)
-            await settle_map_state(tab, ignore=ignore)
+            await settle_map_state(tab, search_term, ignore=ignore)
         st = await get_current_state(tab)
         state_key = st.split("|")[0]
         if state_key in ignore:
@@ -1385,12 +1555,22 @@ async def main():
 
     # load persisted map state if available
     saved_state = conn.execute(
-        "SELECT lat, lon, zoom, pan_direction, search_term, last_lat_direction FROM map_state LIMIT 1"
+        "SELECT lat, lon, zoom, pan_direction, search_term, last_lat_direction, current_tile_z, current_tile_x, current_tile_y FROM map_state LIMIT 1"
     ).fetchone()
     start_url = "https://maps.google.com"
     search_term = None
     if saved_state and saved_state[0] is not None and saved_state[1] is not None:
-        s_lat, s_lon, s_zoom, s_pan, s_search, s_last_lat_dir = saved_state
+        (
+            s_lat,
+            s_lon,
+            s_zoom,
+            s_pan,
+            s_search,
+            s_last_lat_dir,
+            s_tile_z,
+            s_tile_x,
+            s_tile_y,
+        ) = saved_state
         if s_zoom is None:
             s_zoom = 12.0
         search_term = s_search
@@ -1415,7 +1595,7 @@ async def main():
 
     # pick or resume search term
     if not search_term:
-        search_term = "mcdonalds"  # default term if none persisted yet
+        search_term = "ymca"  # default term if none persisted yet
         sb_exists = False
         while not sb_exists:
             # google maps may need reloaded if the search box never appears
@@ -1439,7 +1619,7 @@ async def main():
     existing_tile_rows = conn.execute(
         "SELECT COUNT(*) FROM tiles WHERE search_term = ?", (search_term,)
     ).fetchone()[0]
-    await asyncio.sleep(random.uniform(1.5, 2.5))
+    await asyncio.sleep(random.uniform(3, 4))
     map_center = await get_map_viewport_center(tab)
     root_zoom = await zoom_out_to_limit(tab, map_center)
     logging.info("world zoom-out complete: root_zoom=%s", root_zoom)
@@ -1568,11 +1748,23 @@ async def main():
     while True:
         row = next_pending_tile(search_term)
         if not row:
+            # check for completion
+            unfinished = conn.execute(
+                "SELECT COUNT(*) FROM tiles WHERE search_term=? AND (status != 'completed' OR expanded = FALSE OR feed_complete = FALSE)",
+                (search_term,),
+            ).fetchone()[0]
+            if unfinished == 0:
+                logging.info("All tiles completed for search_term %s", search_term)
+                break
             await asyncio.sleep(2.0)
             continue
         z, x, y = row
         mark_tile_status(search_term, z, x, y, "in_progress")
         await process_tile(z, x, y)
+        # save current tile
+        cur_lat, cur_lon = await get_lat_lon_from_M6(tab)
+        cur_zoom = lat_lon_zoom(tab.url)[2]
+        save_map_state(cur_lat, cur_lon, cur_zoom, "pan", search_term, None, z, x, y)
         await asyncio.sleep(random.uniform(0.5, 1.2))
 
 
